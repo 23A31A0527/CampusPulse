@@ -1,6 +1,12 @@
 
 import { useEffect, useState } from "react";
-
+import { onAuthStateChanged, signOut } from "firebase/auth";
+import {
+  doc, getDoc, collection, addDoc, query, where, onSnapshot,
+  updateDoc, serverTimestamp
+} from "firebase/firestore";
+import { auth, db } from "./firebase";
+import Auth from "./Auth";
 import {
   LayoutDashboard,
   ClipboardList,
@@ -272,11 +278,179 @@ function CategoryIcon({ category }) {
 }
 
 // =====================================
+// FIRESTORE NOTIFICATIONS
+// =====================================
+
+async function createNotification(notification) {
+  try {
+    await addDoc(collection(db, "notifications"), {
+      ...notification,
+      read: false,
+      createdAt: serverTimestamp()
+    });
+  } catch (error) {
+    console.error("Could not create notification:", error);
+  }
+}
+
+function NotificationBell({ user, role }) {
+  const [notifications, setNotifications] = useState([]);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    const notificationsRef = collection(db, "notifications");
+    const received = new Map();
+    const publish = () => {
+      setNotifications(
+        [...received.values()].sort((a, b) => {
+          const aTime = a.createdAt?.toMillis?.() || 0;
+          const bTime = b.createdAt?.toMillis?.() || 0;
+          return bTime - aTime;
+        })
+      );
+    };
+
+    const personalQuery = query(
+      notificationsRef,
+      where("recipientId", "==", user.uid)
+    );
+    const stopPersonal = onSnapshot(personalQuery, snapshot => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type === "removed") received.delete(change.doc.id);
+        else received.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
+      });
+      publish();
+    }, error => console.error("Personal notifications error:", error));
+
+    let stopAdmin = () => {};
+    if (role === "admin") {
+      const adminQuery = query(
+        notificationsRef,
+        where("recipientRole", "==", "admin")
+      );
+      stopAdmin = onSnapshot(adminQuery, snapshot => {
+        snapshot.docChanges().forEach(change => {
+          if (change.type === "removed") received.delete(change.doc.id);
+          else received.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
+        });
+        publish();
+      }, error => console.error("Admin notifications error:", error));
+    }
+
+    return () => {
+      stopPersonal();
+      stopAdmin();
+    };
+  }, [user?.uid, role]);
+
+  const unreadCount = notifications.filter(item => !item.read).length;
+
+  async function markAsRead(item) {
+    if (item.read) return;
+    try {
+      await updateDoc(doc(db, "notifications", item.id), { read: true });
+    } catch (error) {
+      console.error("Could not mark notification as read:", error);
+    }
+  }
+
+  async function markAllRead() {
+    await Promise.all(
+      notifications.filter(item => !item.read).map(item =>
+        updateDoc(doc(db, "notifications", item.id), { read: true })
+      )
+    );
+  }
+
+  return (
+    <div className="notification-wrapper">
+      <button
+        type="button"
+        className="icon-button notification-trigger"
+        aria-label={`Notifications, ${unreadCount} unread`}
+        onClick={() => setOpen(value => !value)}
+      >
+        <Bell size={19} />
+        {unreadCount > 0 && <span className="notification-count">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+      </button>
+
+      {open && (
+        <div className="notification-panel">
+          <div className="notification-panel-header">
+            <div><strong>Notifications</strong><span>{unreadCount} unread</span></div>
+            {unreadCount > 0 && <button type="button" onClick={markAllRead}>Mark all read</button>}
+          </div>
+          <div className="notification-list">
+            {notifications.length === 0 ? (
+              <p className="notification-empty">You're all caught up!</p>
+            ) : notifications.map(item => (
+              <button
+                type="button"
+                key={item.id}
+                className={`notification-item ${item.read ? "is-read" : "is-unread"}`}
+                onClick={() => markAsRead(item)}
+              >
+                <span className="notification-item-dot" />
+                <span><strong>{item.title}</strong><small>{item.message}</small></span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================
 // MAIN APPLICATION
 // =====================================
 
 function App() {
+  // Firebase authentication and Firestore role lookup
+  const [authUser, setAuthUser] = useState(null);
+  const [authRole, setAuthRole] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setAuthUser(user);
+
+      if (!user) {
+        setAuthRole(null);
+        setAuthLoading(false);
+        return;
+      }
+
+      try {
+        const userRef = doc(db, "users", user.uid);
+        const userSnapshot = await getDoc(userRef);
+
+        // Unknown or missing roles are treated as student, never admin.
+        const savedRole = userSnapshot.exists()
+          ? userSnapshot.data().role
+          : null;
+
+        setAuthRole(savedRole === "admin" ? "admin" : "student");
+      } catch (error) {
+        console.error("Could not load user role:", error);
+        setAuthRole("student");
+      } finally {
+        setAuthLoading(false);
+      }
+    });
+
+    return unsubscribe;
+  }, []);
+
+  const handleLogout = async () => {
+  try {
+    await signOut(auth);
+  } catch (error) {
+    console.error("Logout failed:", error);
+  }
+};
   // Load saved issues
   const [issues, setIssues] = useState(() => {
     try {
@@ -594,11 +768,26 @@ Do you want to submit this report separately?`
     const newIssue = {
       ...newIssueData,
       id: Date.now(),
+      reportedBy: authUser.uid,
+      reporterName: authUser.displayName || authUser.email,
       status: "Pending",
       date: new Date().toISOString().slice(0, 10)
     };
 
     setIssues(prev => [newIssue, ...prev]);
+
+    // Notify all admin accounts that a new complaint was submitted.
+    // This path is also used by admin-created issues; only student submissions
+    // should trigger the admin alert.
+    if (authRole === "student") {
+      createNotification({
+        recipientRole: "admin",
+        type: "new_complaint",
+        title: "New complaint submitted",
+        message: `${newIssue.title} · ${newIssue.location}`,
+        issueId: String(newIssue.id)
+      });
+    }
 
     // Reset form
     setForm({
@@ -617,19 +806,68 @@ Do you want to submit this report separately?`
   // UPDATE STATUS
   // =====================================
 
-  function updateStatus(id, status) {
+  async function updateStatus(id, status) {
+    const existingIssue = issues.find(issue => String(issue.id) === String(id));
+    if (!existingIssue || existingIssue.status === status) return;
+
     setIssues(prev =>
       prev.map(issue =>
-        issue.id === id
-          ? { ...issue, status }
-          : issue
+        String(issue.id) === String(id) ? { ...issue, status } : issue
       )
     );
+
+    // Notify the student who originally submitted this complaint.
+    if (existingIssue.reportedBy) {
+      await createNotification({
+        recipientId: existingIssue.reportedBy,
+        recipientRole: "student",
+        type: "status_update",
+        title: "Complaint status updated",
+        message: `“${existingIssue.title}” is now ${status}.`,
+        issueId: String(existingIssue.id)
+      });
+    }
   }
 
   // =====================================
   // MAIN JSX
   // =====================================
+  if (authLoading) {
+    return <div>Loading...</div>;
+  }
+
+  if (!authUser) {
+    return <Auth />;
+  }
+
+  // Automatically show the correct dashboard based on the Firestore role.
+  if (authRole === "student") {
+    return (
+      <StudentDashboard
+        user={authUser}
+        issues={issues.filter(issue => issue.reportedBy === authUser.uid)}
+        onLogout={handleLogout}
+        onSubmitIssue={(issueData) => {
+          const newIssue = {
+            ...issueData,
+            id: Date.now(),
+            reportedBy: authUser.uid,
+            reporterName: authUser.displayName || authUser.email,
+            status: "Pending",
+            date: new Date().toISOString().slice(0, 10)
+          };
+          setIssues(prev => [newIssue, ...prev]);
+          createNotification({
+            recipientRole: "admin",
+            type: "new_complaint",
+            title: "New complaint submitted",
+            message: `${newIssue.title} · ${newIssue.location}`,
+            issueId: String(newIssue.id)
+          });
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app-layout">
@@ -726,16 +964,22 @@ Do you want to submit this report separately?`
           </div>
 
           <div className="user-profile">
-
-            <div className="avatar">
-              AD
-            </div>
+<div className="avatar">
+  {authUser?.displayName
+    ?.split(" ")
+    .map((word) => word[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase() || "U"}
+</div>
 
             <div>
-              <strong>Campus Admin</strong>
+              <strong>{authUser?.displayName || "Campus Admin"}</strong>
               <span>Administrator</span>
             </div>
-
+            <button onClick={handleLogout} className="logout-btn">
+              Logout
+            </button>
           </div>
 
         </div>
@@ -760,17 +1004,16 @@ Do you want to submit this report separately?`
 
           <div className="topbar-actions">
 
-            <button
-              className="icon-button"
-              aria-label="Notifications"
-            >
-              <Bell size={19} />
-              <span className="notification-dot"></span>
-            </button>
+            <NotificationBell user={authUser} role="admin" />
 
-            <div className="avatar">
-              AD
-            </div>
+<div className="avatar">
+  {authUser?.displayName
+    ?.split(" ")
+    .map((word) => word[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase() || "U"}
+</div>
 
           </div>
 
@@ -781,8 +1024,9 @@ Do you want to submit this report separately?`
         <section className="welcome-section">
 
           <div>
-            <h1>Good morning, Admin 👋</h1>
-
+            <h2>
+  Good morning, {authUser?.displayName || authUser?.email?.split("@")[0] || "Student"} 👋
+</h2>
             <p>
               Here's what's happening around your campus today.
             </p>
@@ -1869,5 +2113,183 @@ function StatCard({ title, value, icon, color }) {
 
   );
 }
+
+
+// =====================================
+// STUDENT DASHBOARD
+// =====================================
+
+function StudentDashboard({ user, issues, onLogout, onSubmitIssue }) {
+  const [showForm, setShowForm] = useState(false);
+  const [title, setTitle] = useState("");
+  const [category, setCategory] = useState("Internet");
+  const [location, setLocation] = useState("");
+  const [description, setDescription] = useState("");
+  const [error, setError] = useState("");
+
+  const handleStudentSubmit = (e) => {
+    e.preventDefault();
+    setError("");
+
+    if (!title.trim() || !location.trim() || !description.trim()) {
+      setError("Please complete all fields.");
+      return;
+    }
+
+    onSubmitIssue({
+      title: title.trim(),
+      category,
+      location: location.trim(),
+      description: description.trim(),
+      severity: "Medium",
+      people: 1
+    });
+
+    setTitle("");
+    setCategory("Internet");
+    setLocation("");
+    setDescription("");
+    setShowForm(false);
+  };
+
+  const firstName = user.displayName || user.email?.split("@")[0] || "Student";
+  const initials = (user.displayName || user.email || "S")
+    .split(/[ @.]+/)
+    .filter(Boolean)
+    .map(part => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+
+  return (
+    <div className="student-page">
+      <header className="student-topbar">
+        <div className="student-brand">
+          <div className="student-brand-icon"><Activity size={22} /></div>
+          <span>Campus<span>Pulse</span></span>
+        </div>
+        <div className="student-account">
+          <NotificationBell user={user} role="student" />
+          <div className="avatar">{initials}</div>
+          <div className="student-account-info">
+            <strong>{firstName}</strong>
+            <span>Student</span>
+          </div>
+          <button className="logout-btn" onClick={onLogout}>Logout</button>
+        </div>
+      </header>
+
+      <main className="student-main">
+        <section className="student-welcome">
+          <div>
+            <span className="student-eyebrow">STUDENT WORKSPACE</span>
+            <h1>Welcome, {firstName} 👋</h1>
+            <p>Report campus problems and track the progress of your complaints.</p>
+          </div>
+          <button className="primary-button" onClick={() => setShowForm(true)}>
+            <Plus size={18} /> Report an Issue
+          </button>
+        </section>
+
+        <section className="student-stats">
+          <div className="student-stat-card">
+            <span>My Reports</span><strong>{issues.length}</strong>
+          </div>
+          <div className="student-stat-card">
+            <span>Pending</span>
+            <strong>{issues.filter(issue => issue.status === "Pending").length}</strong>
+          </div>
+          <div className="student-stat-card">
+            <span>In Progress</span>
+            <strong>{issues.filter(issue => issue.status === "In Progress").length}</strong>
+          </div>
+          <div className="student-stat-card">
+            <span>Resolved</span>
+            <strong>{issues.filter(issue => issue.status === "Resolved").length}</strong>
+          </div>
+        </section>
+
+        <section className="student-reports">
+          <div className="student-reports-heading">
+            <div>
+              <h2>My Complaints</h2>
+              <p>Track the status of issues you have submitted.</p>
+            </div>
+          </div>
+
+          {issues.length === 0 ? (
+            <div className="student-empty">
+              <ClipboardList size={32} />
+              <strong>No reports yet</strong>
+              <p>Use “Report an Issue” to tell the campus team about a problem.</p>
+            </div>
+          ) : (
+            <div className="student-report-list">
+              {issues.slice().sort((a, b) => b.id - a.id).map(issue => (
+                <article className="student-report-card" key={issue.id}>
+                  <div className="student-report-icon"><CategoryIcon category={issue.category} /></div>
+                  <div className="student-report-content">
+                    <strong>{issue.title}</strong>
+                    <span>{issue.category} · {issue.location}</span>
+                    <p>{issue.description}</p>
+                    <small>Reported on {issue.date}</small>
+                  </div>
+                  <span className={`status ${issue.status.toLowerCase().replace(" ", "-")}`}>
+                    {issue.status}
+                  </span>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {showForm && (
+          <div className="modal-overlay">
+            <div className="modal">
+              <div className="modal-header">
+                <div>
+                  <h3>Report a Campus Issue</h3>
+                  <p>Provide details so the campus team can help.</p>
+                </div>
+                <button className="close-button" onClick={() => setShowForm(false)} type="button">
+                  <X size={18} />
+                </button>
+              </div>
+
+              <form onSubmit={handleStudentSubmit}>
+                <label>Issue Title</label>
+                <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Wi-Fi not working" required />
+
+                <div className="form-row">
+                  <div>
+                    <label>Category</label>
+                    <select value={category} onChange={e => setCategory(e.target.value)}>
+                      {categories.map(item => <option key={item}>{item}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Location</label>
+                    <input value={location} onChange={e => setLocation(e.target.value)} placeholder="e.g. Block A" required />
+                  </div>
+                </div>
+
+                <label>Description</label>
+                <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="Describe the issue..." required />
+
+                {error && <p className="auth-error">{error}</p>}
+
+                <div className="modal-actions">
+                  <button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button>
+                  <button type="submit" className="primary-button"><Plus size={17} /> Submit Issue</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
 
 export default App;
