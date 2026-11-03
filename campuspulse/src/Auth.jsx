@@ -4,43 +4,47 @@ import {
   createUserWithEmailAndPassword,
   updateProfile,
 } from "firebase/auth";
-import { auth } from "./firebase";
+import { doc, setDoc, serverTimestamp } from "firebase/firestore";
+import { auth, db } from "./firebase";
 
-export default function Auth({ onLogin }) {
+export default function Auth() {
   const [isSignup, setIsSignup] = useState(false);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
+    setLoading(true);
 
     try {
-      let result;
-
       if (isSignup) {
-        result = await createUserWithEmailAndPassword(
-          auth,
-          email,
-          password
-        );
+        const cleanName = name.trim();
+        const cleanEmail = email.trim().toLowerCase();
 
-        await updateProfile(result.user, {
-          displayName: name,
+        const result = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        await updateProfile(result.user, { displayName: cleanName });
+
+        // Every new signup receives a student profile at users/{uid}.
+        await setDoc(doc(db, "users", result.user.uid), {
+          uid: result.user.uid,
+          name: cleanName,
+          email: cleanEmail,
+          role: "student",
+          createdAt: serverTimestamp(),
         });
       } else {
-        result = await signInWithEmailAndPassword(
-          auth,
-          email,
-          password
-        );
+        await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
       }
-
-      onLogin(result.user);
+      // App.jsx handles routing through onAuthStateChanged.
     } catch (err) {
-      setError(err.message);
+      console.error("Authentication failed:", err);
+      setError(err.message || "Something went wrong. Please try again.");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -78,8 +82,8 @@ export default function Auth({ onLogin }) {
 
         {error && <p className="auth-error">{error}</p>}
 
-        <button type="submit">
-          {isSignup ? "Sign Up" : "Login"}
+        <button type="submit" disabled={loading}>
+          {loading ? "Please wait..." : isSignup ? "Sign Up" : "Login"}
         </button>
 
         <p>

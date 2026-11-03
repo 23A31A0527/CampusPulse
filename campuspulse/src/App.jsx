@@ -49,53 +49,6 @@ import "./App.css";
 // INITIAL SAMPLE DATA
 // =====================================
 
-const initialIssues = [
-  {
-    id: 1,
-    title: "Wi-Fi not working in Block A",
-    category: "Internet",
-    location: "Block A",
-    description: "Students cannot connect to campus Wi-Fi.",
-    severity: "High",
-    people: 80,
-    status: "Pending",
-    date: "2026-10-30"
-  },
-  {
-    id: 2,
-    title: "Projector malfunction",
-    category: "Equipment",
-    location: "Room 204",
-    description: "Classroom projector is not displaying properly.",
-    severity: "Medium",
-    people: 35,
-    status: "In Progress",
-    date: "2026-10-29"
-  },
-  {
-    id: 3,
-    title: "Water leakage near washroom",
-    category: "Water",
-    location: "Block B",
-    description: "Continuous water leakage near washroom.",
-    severity: "High",
-    people: 50,
-    status: "Pending",
-    date: "2026-10-28"
-  },
-  {
-    id: 4,
-    title: "Broken classroom fan",
-    category: "Maintenance",
-    location: "Room 105",
-    description: "One ceiling fan is not functioning.",
-    severity: "Low",
-    people: 30,
-    status: "Resolved",
-    date: "2026-10-27"
-  }
-];
-
 const categories = [
   "Internet",
   "Equipment",
@@ -451,41 +404,46 @@ function App() {
     console.error("Logout failed:", error);
   }
 };
-  // Load saved issues
-  const [issues, setIssues] = useState(() => {
-    try {
-      const saved = localStorage.getItem(
-        "campuspulse_issues"
-      );
-
-      return saved
-        ? JSON.parse(saved)
-        : initialIssues;
-    } catch {
-      return initialIssues;
-    }
-  });
-
+  // Live Firestore complaints: admins see all, students see only their own.
+  const [issues, setIssues] = useState([]);
+  const [issuesLoading, setIssuesLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
   const [showForm, setShowForm] = useState(false);
 
-  const [form, setForm] = useState({
-    title: "",
-    category: "Internet",
-    location: "",
-    description: "",
-    severity: "Medium",
-    people: 10
-  });
-
-  // Save issues automatically
   useEffect(() => {
-    localStorage.setItem(
-      "campuspulse_issues",
-      JSON.stringify(issues)
+    if (!authUser?.uid || !authRole) {
+      setIssues([]);
+      setIssuesLoading(false);
+      return;
+    }
+
+    const issuesRef = collection(db, "issues");
+    const issuesQuery = authRole === "admin"
+      ? issuesRef
+      : query(issuesRef, where("reportedBy", "==", authUser.uid));
+
+    const unsubscribe = onSnapshot(
+      issuesQuery,
+      snapshot => {
+        const loaded = snapshot.docs.map(issueDoc => ({
+          id: issueDoc.id,
+          ...issueDoc.data()
+        }));
+        loaded.sort((a, b) =>
+          (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0)
+        );
+        setIssues(loaded);
+        setIssuesLoading(false);
+      },
+      error => {
+        console.error("Could not load complaints from Firestore:", error);
+        setIssuesLoading(false);
+      }
     );
-  }, [issues]);
+
+    return unsubscribe;
+  }, [authUser?.uid, authRole]);
 
   // =====================================
   // DASHBOARD STATISTICS
@@ -710,8 +668,9 @@ function App() {
   // SUBMIT NEW ISSUE
   // =====================================
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     e.preventDefault();
+    if (!authUser?.uid) return;
 
     const newIssueData = {
       ...form,
@@ -720,86 +679,55 @@ function App() {
       people: Number(form.people)
     };
 
-    // Check similar complaints
-    const similarIssues = findSimilarIssues(
-      newIssueData,
-      issues
-    );
-
-    // Check duplicate at same location
-    const duplicate = similarIssues.find(
-      issue =>
-        normalizeLocation(issue.location) ===
-        normalizeLocation(newIssueData.location)
+    const similarIssues = findSimilarIssues(newIssueData, issues);
+    const duplicate = similarIssues.find(issue =>
+      normalizeLocation(issue.location) === normalizeLocation(newIssueData.location)
     );
 
     if (duplicate) {
-      alert(
-        `Possible duplicate detected!
-
-Existing issue: ${duplicate.title}
-Location: ${duplicate.location}
-Status: ${duplicate.status}
-
-Please check the existing complaint before submitting.`
-      );
-
+      alert(`Possible duplicate detected!\\n\\nExisting issue: ${duplicate.title}\\nLocation: ${duplicate.location}\\nStatus: ${duplicate.status}`);
       return;
     }
 
-    // Warn about similar reports elsewhere
     if (similarIssues.length > 0) {
-      const locations = similarIssues
-        .map(issue => issue.location)
-        .join(", ");
-
-      const proceed = window.confirm(
-        `Similar complaints already exist at:
-
-${locations}
-
-Do you want to submit this report separately?`
-      );
-
-      if (!proceed) return;
+      const locations = similarIssues.map(issue => issue.location).join(", ");
+      if (!window.confirm(`Similar complaints already exist at:\\n\\n${locations}\\n\\nSubmit separately?`)) return;
     }
 
-    // Create new issue
-    const newIssue = {
-      ...newIssueData,
-      id: Date.now(),
-      reportedBy: authUser.uid,
-      reporterName: authUser.displayName || authUser.email,
-      status: "Pending",
-      date: new Date().toISOString().slice(0, 10)
-    };
-
-    setIssues(prev => [newIssue, ...prev]);
-
-    // Notify all admin accounts that a new complaint was submitted.
-    // This path is also used by admin-created issues; only student submissions
-    // should trigger the admin alert.
-    if (authRole === "student") {
-      createNotification({
-        recipientRole: "admin",
-        type: "new_complaint",
-        title: "New complaint submitted",
-        message: `${newIssue.title} · ${newIssue.location}`,
-        issueId: String(newIssue.id)
+    try {
+      const issueRef = await addDoc(collection(db, "issues"), {
+        ...newIssueData,
+        reportedBy: authUser.uid,
+        reporterName: authUser.displayName || authUser.email,
+        status: "Pending",
+        date: new Date().toISOString().slice(0, 10),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
       });
+
+      if (authRole === "student") {
+        await createNotification({
+          recipientRole: "admin",
+          type: "new_complaint",
+          title: "New complaint submitted",
+          message: `${newIssueData.title} · ${newIssueData.location}`,
+          issueId: issueRef.id
+        });
+      }
+
+      setForm({
+        title: "",
+        category: "Internet",
+        location: "",
+        description: "",
+        severity: "Medium",
+        people: 10
+      });
+      setShowForm(false);
+    } catch (error) {
+      console.error("Could not submit complaint:", error);
+      alert("Your complaint could not be submitted. Please try again.");
     }
-
-    // Reset form
-    setForm({
-      title: "",
-      category: "Internet",
-      location: "",
-      description: "",
-      severity: "Medium",
-      people: 10
-    });
-
-    setShowForm(false);
   }
 
   // =====================================
@@ -810,22 +738,25 @@ Do you want to submit this report separately?`
     const existingIssue = issues.find(issue => String(issue.id) === String(id));
     if (!existingIssue || existingIssue.status === status) return;
 
-    setIssues(prev =>
-      prev.map(issue =>
-        String(issue.id) === String(id) ? { ...issue, status } : issue
-      )
-    );
-
-    // Notify the student who originally submitted this complaint.
-    if (existingIssue.reportedBy) {
-      await createNotification({
-        recipientId: existingIssue.reportedBy,
-        recipientRole: "student",
-        type: "status_update",
-        title: "Complaint status updated",
-        message: `“${existingIssue.title}” is now ${status}.`,
-        issueId: String(existingIssue.id)
+    try {
+      await updateDoc(doc(db, "issues", id), {
+        status,
+        updatedAt: serverTimestamp()
       });
+
+      if (existingIssue.reportedBy) {
+        await createNotification({
+          recipientId: existingIssue.reportedBy,
+          recipientRole: "student",
+          type: "status_update",
+          title: "Complaint status updated",
+          message: `“${existingIssue.title}” is now ${status}.`,
+          issueId: String(existingIssue.id)
+        });
+      }
+    } catch (error) {
+      console.error("Could not update complaint status:", error);
+      alert("Status update failed. Please try again.");
     }
   }
 
@@ -840,6 +771,10 @@ Do you want to submit this report separately?`
     return <Auth />;
   }
 
+  if (issuesLoading) {
+    return <div className="app-loading">Loading complaints...</div>;
+  }
+
   // Automatically show the correct dashboard based on the Firestore role.
   if (authRole === "student") {
     return (
@@ -847,23 +782,30 @@ Do you want to submit this report separately?`
         user={authUser}
         issues={issues.filter(issue => issue.reportedBy === authUser.uid)}
         onLogout={handleLogout}
-        onSubmitIssue={(issueData) => {
-          const newIssue = {
-            ...issueData,
-            id: Date.now(),
-            reportedBy: authUser.uid,
-            reporterName: authUser.displayName || authUser.email,
-            status: "Pending",
-            date: new Date().toISOString().slice(0, 10)
-          };
-          setIssues(prev => [newIssue, ...prev]);
-          createNotification({
-            recipientRole: "admin",
-            type: "new_complaint",
-            title: "New complaint submitted",
-            message: `${newIssue.title} · ${newIssue.location}`,
-            issueId: String(newIssue.id)
-          });
+        onSubmitIssue={async (issueData) => {
+          try {
+            const issueRef = await addDoc(collection(db, "issues"), {
+              ...issueData,
+              reportedBy: authUser.uid,
+              reporterName: authUser.displayName || authUser.email,
+              status: "Pending",
+              date: new Date().toISOString().slice(0, 10),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            });
+
+            await createNotification({
+              recipientRole: "admin",
+              type: "new_complaint",
+              title: "New complaint submitted",
+              message: `${issueData.title} · ${issueData.location}`,
+              issueId: issueRef.id
+            });
+          } catch (error) {
+            console.error("Could not submit student complaint:", error);
+            alert("Your complaint could not be submitted. Please try again.");
+            throw error;
+          }
         }}
       />
     );
@@ -2127,7 +2069,7 @@ function StudentDashboard({ user, issues, onLogout, onSubmitIssue }) {
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
 
-  const handleStudentSubmit = (e) => {
+  const handleStudentSubmit = async (e) => {
     e.preventDefault();
     setError("");
 
@@ -2136,20 +2078,24 @@ function StudentDashboard({ user, issues, onLogout, onSubmitIssue }) {
       return;
     }
 
-    onSubmitIssue({
-      title: title.trim(),
-      category,
-      location: location.trim(),
-      description: description.trim(),
-      severity: "Medium",
-      people: 1
-    });
+    try {
+      await onSubmitIssue({
+        title: title.trim(),
+        category,
+        location: location.trim(),
+        description: description.trim(),
+        severity: "Medium",
+        people: 1
+      });
 
-    setTitle("");
-    setCategory("Internet");
-    setLocation("");
-    setDescription("");
-    setShowForm(false);
+      setTitle("");
+      setCategory("Internet");
+      setLocation("");
+      setDescription("");
+      setShowForm(false);
+    } catch {
+      setError("Could not submit your complaint. Please try again.");
+    }
   };
 
   const firstName = user.displayName || user.email?.split("@")[0] || "Student";
@@ -2225,7 +2171,11 @@ function StudentDashboard({ user, issues, onLogout, onSubmitIssue }) {
             </div>
           ) : (
             <div className="student-report-list">
-              {issues.slice().sort((a, b) => b.id - a.id).map(issue => (
+              {issues.slice().sort((a, b) => {
+                const aTime = a.createdAt?.toMillis?.() || new Date(a.date || 0).getTime();
+                const bTime = b.createdAt?.toMillis?.() || new Date(b.date || 0).getTime();
+                return bTime - aTime;
+              }).map(issue => (
                 <article className="student-report-card" key={issue.id}>
                   <div className="student-report-icon"><CategoryIcon category={issue.category} /></div>
                   <div className="student-report-content">
